@@ -201,18 +201,32 @@ def get_cot_data():
             return parts
         rows = [parse_csv(l) for l in lines]
         df   = pd.DataFrame(rows)
-        if df.shape[1] < 10:
+        if df.shape[1] < 17:
             return None
-        df.columns = (
-            ["market_name","date_str","report_date","contract_code",
-             "open_interest","nc_long","nc_short","nc_spread",
-             "comm_long","comm_short"]
-            + [f"_c{i}" for i in range(10, df.shape[1])]
-        )
-        for c in ["open_interest","nc_long","nc_short","nc_spread","comm_long","comm_short"]:
+        # CFTC "Traders in Financial Futures" (FinFutWk) short-format layout:
+        #  0 market  3 contract_code  7 open_interest
+        #  8-10 Dealer L/S/Spread  11-13 Asset-Mgr L/S/Spread  14-16 Leveraged L/S/Spread
+        named = [
+            "market_name","date_str","report_date","contract_code",
+            "mkt_code","region_code","commodity_code","open_interest",
+            "dealer_long","dealer_short","dealer_spread",
+            "am_long","am_short","am_spread",
+            "lev_long","lev_short","lev_spread",
+        ]
+        n = df.shape[1]
+        df.columns = named + [f"_c{i}" for i in range(len(named), n)]
+        num_cols = ["open_interest","dealer_long","dealer_short","dealer_spread",
+                    "am_long","am_short","am_spread","lev_long","lev_short","lev_spread"]
+        for c in num_cols:
             df[c] = pd.to_numeric(df[c].astype(str).str.replace(",",""), errors="coerce")
-        df["nc_net"]        = df["nc_long"]   - df["nc_short"]
-        df["comm_net"]      = df["comm_long"] - df["comm_short"]
+        # Non-commercial (large speculators) = Asset Managers + Leveraged Funds
+        df["nc_long"]  = df["am_long"].fillna(0)  + df["lev_long"].fillna(0)
+        df["nc_short"] = df["am_short"].fillna(0) + df["lev_short"].fillna(0)
+        df["nc_net"]   = df["nc_long"] - df["nc_short"]
+        # Commercial (dealers / intermediaries)
+        df["comm_long"]  = df["dealer_long"]
+        df["comm_short"] = df["dealer_short"]
+        df["comm_net"]   = df["comm_long"] - df["comm_short"]
         df["contract_code"] = df["contract_code"].astype(str).str.strip()
         df["market_name"]   = df["market_name"].astype(str).str.strip()
         return df
@@ -415,31 +429,63 @@ def get_currency_strength(lookback: int = 14):
     return {c: round(strength[c]/counts[c], 3) if counts[c] > 0 else 0.0
             for c in ALL_CURRENCIES}
 
+def _valuation_stats(close, lookback: int):
+    close = close.dropna()
+    if len(close) < 50:
+        return None
+    current = close.iloc[-1]
+    hist    = close.tail(min(lookback, len(close)))
+    # Simple over/under valuation: where does the current price sit within its
+    # own recent range? (percentile 0-100). No z-score / std-dev involved.
+    pct     = float((hist < current).sum()) / len(hist) * 100
+    hi, lo  = hist.max(), hist.min()
+    rpos    = (current - lo) / (hi - lo) * 100 if hi != lo else 50.0
+    span    = min(200, max(20, len(close)//2))
+    ema     = close.ewm(span=span, adjust=False).mean().iloc[-1]
+    ema_dev = (current - ema) / ema * 100 if ema else 0.0
+    if   pct >= 85: sig, col = "🔴 OVERVALUED",  "#f85149"
+    elif pct >= 65: sig, col = "🟠 SLIGHT OV",   "#f0883e"
+    elif pct <= 15: sig, col = "🟢 UNDERVALUED", "#56d364"
+    elif pct <= 35: sig, col = "🟡 SLIGHT UV",   "#e3b341"
+    else:           sig, col = "⚪ FAIR VALUE",   "#8b949e"
+    # scorecard score: cheap = bullish (+1), rich = bearish (-1)
+    val_score = round((50.0 - pct) / 50.0, 2)
+    return {"current":current,"percentile":round(pct,1),"range_pos":round(rpos,1),
+            "ema_dev":round(ema_dev,2),"hi":hi,"lo":lo,
+            "signal":sig,"color":col,"val_score":val_score}
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_valuation(symbol: str, lookback: int = 252):
+    # Raw price valuation. For an FX pair the price already IS base-vs-quote,
+    # so this measures the base currency's value against the quote.
     df = get_prices(symbol, period="3y", interval="1d")
     if df is None or len(df) < 50:
         return None
-    close   = df["Close"].dropna()
-    current = close.iloc[-1]
-    hist    = close.tail(min(lookback, len(close)))
-    mu, sigma = hist.mean(), hist.std()
-    z       = (current - mu) / sigma if sigma > 0 else 0.0
-    pct     = float((hist < current).sum()) / len(hist) * 100
-    span    = min(200, max(20, len(close)//2))
-    ema     = close.ewm(span=span, adjust=False).mean().iloc[-1]
-    ema_dev = (current - ema) / ema * 100
-    hist52  = close.tail(min(252, len(close)))
-    hi52, lo52 = hist52.max(), hist52.min()
-    rpos    = (current - lo52) / (hi52 - lo52) * 100 if hi52 != lo52 else 50.0
-    if   z >  2: sig, col = "🔴 OVERVALUED",      "#f85149"
-    elif z >  1: sig, col = "🟠 SLIGHT OV",        "#f0883e"
-    elif z < -2: sig, col = "🟢 UNDERVALUED",      "#56d364"
-    elif z < -1: sig, col = "🟡 SLIGHT UV",         "#e3b341"
-    else:        sig, col = "⚪ FAIR VALUE",        "#8b949e"
-    return {"current":current,"z_score":round(z,2),"percentile":round(pct,1),
-            "ema_dev":round(ema_dev,2),"range_pos":round(rpos,1),
-            "hi52":hi52,"lo52":lo52,"signal":sig,"color":col}
+    return _valuation_stats(df["Close"], lookback)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_valuation_ratio(symbol: str, denom_symbol: str, lookback: int = 252):
+    """Value `symbol` AGAINST `denom_symbol` by z-scoring the price ratio.
+    e.g. US100 vs the Dollar (DXY) or vs Treasuries (TLT)."""
+    a = get_prices(symbol, period="3y", interval="1d")
+    b = get_prices(denom_symbol, period="3y", interval="1d")
+    if a is None or b is None:
+        return None
+    combined = pd.DataFrame({"a": a["Close"], "b": b["Close"]}).dropna()
+    if len(combined) < 50 or (combined["b"] <= 0).all():
+        return None
+    return _valuation_stats(combined["a"] / combined["b"], lookback)
+
+def valuation_for_instrument(name: str, symbol: str, lookback: int,
+                             ref_symbol: str | None, ref_label: str):
+    """Relative valuation. FX pairs value base-vs-quote (the pair itself);
+    everything else is valued against ref_symbol (Dollar/Bonds) if given."""
+    if symbol.endswith("=X"):                      # forex pair
+        vs = name.split("/")[1] if "/" in name else "quote"
+        return get_valuation(symbol, lookback), vs
+    if ref_symbol:                                 # index / metal / stock vs reference
+        return get_valuation_ratio(symbol, ref_symbol, lookback), ref_label
+    return get_valuation(symbol, lookback), "USD"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_cross_implied(pair_name: str):
@@ -706,11 +752,13 @@ def _score_macro(name: str, macro_scores: dict) -> float | None:
         return round(float(np.clip(((cpi - 2) / 4.0) + (-sc / 4.0), -1, 1)), 2)
     return None
 
-def _score_valuation(symbol: str, lookback: int) -> float | None:
-    v = get_valuation(symbol, lookback)
+VAL_SCORECARD_REF = "DX-Y.NYB"   # non-FX instruments valued vs the US Dollar (DXY)
+
+def _score_valuation(name: str, symbol: str, lookback: int) -> float | None:
+    v, _vs = valuation_for_instrument(name, symbol, lookback, VAL_SCORECARD_REF, "USD")
     if v is None:
         return None
-    return round(float(np.clip(-v["z_score"] / 2.0, -1, 1)), 2)
+    return v["val_score"]
 
 def _score_seasonality(symbol: str, years: int) -> float | None:
     sd = get_seasonality(symbol, years)
@@ -746,7 +794,7 @@ def compute_scorecard(instruments: dict, cb_rates: dict, cot_df,
         cot_s  = _score_cot(name, cot_df)
         carry_s= _score_carry(name, cb_rates)
         macro_s= _score_macro(name, macro_scores)
-        val_s  = _score_valuation(sym, val_lookback)
+        val_s  = _score_valuation(name, sym, val_lookback)
         seas_s = _score_seasonality(sym, season_years)
         sent_s = _score_sentiment(name, sym, fg) if fg is not None else None
         # Weighted scoring — COT and Seasonality count 2x, others 1x
@@ -835,7 +883,7 @@ with st.sidebar:
     st.markdown("### Parameters")
     cs_lookback  = st.slider("FX Strength lookback (days)", 5, 50, 14)
     val_lookback = st.slider("Valuation window (days)", 63, 504, 252)
-    season_years = st.slider("Seasonality history (years)", 3, 15, 10)
+    season_years = st.slider("Seasonality history (years)", 3, 15, 5)
     st.divider()
     if st.button("🔄  Refresh All Data", use_container_width=True):
         st.cache_data.clear()
@@ -1425,7 +1473,22 @@ with tab_cot:
 # ══════════════════════════════════════════════════════════════
 with tab_val:
     st.header("📊  Valuation — Over / Undervalued")
-    st.caption(f"Z-score & percentile vs a {val_lookback}-day window. Any instrument, daily TF.")
+    st.caption(
+        "Is each instrument rich or cheap **relative to what it's priced against**? "
+        "FX pairs are valued base-vs-quote (the pair itself); indices/metals/stocks "
+        "are valued against the reference you pick below. "
+        f"Measured by position in its own {val_lookback}-day range — no z-score."
+    )
+
+    REF_OPTIONS = {
+        "US Dollar (DXY)":     "DX-Y.NYB",
+        "Treasury Bonds (TLT)":"TLT",
+        "Raw USD price":       None,
+    }
+    ref_choice = st.selectbox("Value indices / metals / stocks against", list(REF_OPTIONS),
+                              index=0, key="val_ref")
+    ref_symbol = REF_OPTIONS[ref_choice]
+    ref_label  = ref_choice.split(" (")[0]   # e.g. "US Dollar"
 
     if not ALL_INSTRUMENTS:
         st.info("Select instruments in the sidebar.")
@@ -1433,33 +1496,36 @@ with tab_val:
         with st.spinner("Scoring valuation…"):
             val_rows = []
             for name, sym in ALL_INSTRUMENTS.items():
-                v = get_valuation(sym, val_lookback)
+                v, vs = valuation_for_instrument(name, sym, val_lookback, ref_symbol, ref_label)
                 if v is None:
                     continue
                 val_rows.append({
-                    "Instrument": name,
-                    "Price":      round(v["current"], 4),
-                    "Z-Score":    v["z_score"],
-                    "Percentile": f"{v['percentile']:.0f}%",
-                    "EMA Dev %":  v["ema_dev"],
-                    "52w Range %": f"{v['range_pos']:.0f}%",
-                    "Signal":     v["signal"],
+                    "Instrument":   name,
+                    "Valued vs":    vs,
+                    "Level":        round(v["current"], 4),
+                    "Range Pos":    f"{v['range_pos']:.0f}%",
+                    "Percentile":   f"{v['percentile']:.0f}%",
+                    "EMA Dev %":    v["ema_dev"],
+                    "Signal":       v["signal"],
+                    "_pct":         v["percentile"],
                 })
         if val_rows:
-            vdf = pd.DataFrame(val_rows).sort_values("Z-Score")
-            st.dataframe(vdf, use_container_width=True, hide_index=True, height=420)
+            vdf = pd.DataFrame(val_rows).sort_values("_pct")
+            show = vdf.drop(columns=["_pct"])
+            st.dataframe(show, use_container_width=True, hide_index=True, height=420)
 
             fig_val = go.Figure(go.Bar(
-                x=vdf["Instrument"], y=vdf["Z-Score"],
-                marker_color=["#f85149" if z > 1 else "#56d364" if z < -1 else "#e3b341"
-                              for z in vdf["Z-Score"]],
-                text=[f"{z:+.2f}" for z in vdf["Z-Score"]], textposition="outside"))
-            fig_val.add_hline(y=2,  line_dash="dot", line_color="#f85149", annotation_text="Overvalued")
-            fig_val.add_hline(y=-2, line_dash="dot", line_color="#56d364", annotation_text="Undervalued")
-            fig_val.update_layout(title="Valuation Z-Scores (low = cheap)",
+                x=vdf["Instrument"], y=vdf["_pct"],
+                marker_color=["#f85149" if p >= 85 else "#f0883e" if p >= 65
+                              else "#56d364" if p <= 15 else "#e3b341" if p <= 35
+                              else "#8b949e" for p in vdf["_pct"]],
+                text=[f"{p:.0f}%" for p in vdf["_pct"]], textposition="outside"))
+            fig_val.add_hline(y=85, line_dash="dot", line_color="#f85149", annotation_text="Overvalued")
+            fig_val.add_hline(y=15, line_dash="dot", line_color="#56d364", annotation_text="Undervalued")
+            fig_val.update_layout(title="Position in range (100% = top / rich, 0% = bottom / cheap)",
                                   template="plotly_dark", height=380,
                                   xaxis_tickangle=-30, showlegend=False,
-                                  yaxis=dict(range=[-3.5, 3.5]))
+                                  yaxis=dict(range=[0, 105], title="Percentile"))
             st.plotly_chart(fig_val, use_container_width=True)
         else:
             st.info("No valuation data available.")
