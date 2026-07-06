@@ -270,6 +270,113 @@ def cot_raw_signal(retail_lean, comm_lean, nc_lean):
     if nc_lean   * retail_lean < 0: amp += abs(nc_lean)   * 0.5
     return float(np.clip(base * amp, -1.0, 1.0))
 
+# ── COT Index (Commercials vs Retail) — historical normalisation ──────────
+# Each group's net (as % of open interest) is placed within its OWN range over
+# a lookback window: 0 = most bearish in range, 100 = most bullish in range.
+# Defaults: 26-week responsive index, 156-week (3y) historical hi/lo extreme.
+COT_LB_SHORT = 26
+COT_LB_LONG  = 156
+CFTC_DISAGG_RES = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+CFTC_TFF_RES    = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+COMMODITY_COT_KEYS = {"Gold", "Silver"}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cot_history(code: str, report: str, weeks: int = 170):
+    """Weekly net positioning (% of OI) for a contract over ~3+ years."""
+    url = CFTC_DISAGG_RES if report == "disagg" else CFTC_TFF_RES
+    params = {"cftc_contract_market_code": code,
+              "$order": "report_date_as_yyyy_mm_dd DESC", "$limit": str(weeks)}
+    try:
+        r = requests.get(url, headers={"User-Agent": "FundamentalDashboardV3"},
+                         params=params, timeout=30)
+        if not r.ok:
+            return None
+        rows = r.json()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    def num(col):
+        return pd.to_numeric(df[col], errors="coerce") if col in df.columns \
+               else pd.Series([np.nan] * len(df))
+    if report == "disagg":
+        comm_l = num("prod_merc_positions_long")  + num("swap_positions_long_all")
+        comm_s = num("prod_merc_positions_short") + num("swap__positions_short_all")
+        nc_l   = num("m_money_positions_long_all")  + num("other_rept_positions_long")
+        nc_s   = num("m_money_positions_short_all") + num("other_rept_positions_short")
+    else:
+        comm_l = num("dealer_positions_long_all")
+        comm_s = num("dealer_positions_short_all")
+        nc_l   = num("asset_mgr_positions_long")  + num("lev_money_positions_long")  + num("other_rept_positions_long")
+        nc_s   = num("asset_mgr_positions_short") + num("lev_money_positions_short") + num("other_rept_positions_short")
+    rl = num("nonrept_positions_long_all")
+    rs = num("nonrept_positions_short_all")
+    oi = num("open_interest_all").replace(0, np.nan)
+    out = pd.DataFrame({
+        "date":       pd.to_datetime(df["report_date_as_yyyy_mm_dd"], errors="coerce"),
+        "comm_net":   (comm_l - comm_s) / oi * 100.0,
+        "nc_net":     (nc_l - nc_s)     / oi * 100.0,
+        "retail_net": (rl - rs)         / oi * 100.0,
+    }).dropna().sort_values("date").reset_index(drop=True)
+    return out if len(out) >= 20 else None
+
+def cot_index(series, lookback):
+    """Position of the latest value within its [min,max] over `lookback` -> 0..100."""
+    w = series.tail(lookback)
+    lo, hi = float(w.min()), float(w.max())
+    cur = float(series.iloc[-1])
+    return (cur - lo) / (hi - lo) * 100.0 if hi > lo else 50.0
+
+def resolve_cot(name):
+    entry = INSTRUMENT_COT_MAP.get(name)
+    if entry is None:
+        return None
+    key, direction = entry
+    cc = COT_CODES.get(key)
+    if not cc:
+        return None
+    code, _kw = cc
+    report = "disagg" if key in COMMODITY_COT_KEYS else "tff"
+    return code, report, direction
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cot_index_signal(name: str):
+    """Commercials-vs-Retail COT Index signal for an instrument.
+    Follows commercials (smart money) and fades retail, both measured as an
+    index within their own 26w / 156w range. Returns -1..+1 (direction-applied)."""
+    r = resolve_cot(name)
+    if r is None:
+        return None
+    code, report, direction = r
+    hist = get_cot_history(code, report)
+    if hist is None:
+        return None
+    out = {"direction": direction}
+    for lb, tag in [(COT_LB_SHORT, "s"), (COT_LB_LONG, "l")]:
+        out[f"comm_{tag}"]   = cot_index(hist["comm_net"],   lb)
+        out[f"retail_{tag}"] = cot_index(hist["retail_net"], lb)
+    # Commercials vs Retail: bullish when commercials high in range AND retail low.
+    # The 26-week index is the signal (responsive); 156-week is historical context.
+    out["div_s"] = (out["comm_s"] - out["retail_s"]) / 100.0   # 26w — primary signal
+    out["div_l"] = (out["comm_l"] - out["retail_l"]) / 100.0   # 156w — long-range context
+    out["raw"]   = float(np.clip(out["div_s"], -1.0, 1.0))
+    out["score"] = round(out["raw"] * direction, 2)
+    return out
+
+def cot_index_label(o):
+    if o is None:
+        return "— N/A"
+    raw = o["raw"]                       # from the market's own perspective
+    conf = (o["retail_s"] <= 15 or o["retail_s"] >= 85 or
+            o["comm_s"]   >= 85 or o["comm_s"]   <= 15)
+    tag = " ✓extreme" if conf else ""
+    if   raw >  0.33: return "🟢 BULLISH (comm long / retail short)" + tag
+    elif raw >  0.10: return "🟩 lean bull" + tag
+    elif raw < -0.33: return "🔴 BEARISH (comm short / retail long)" + tag
+    elif raw < -0.10: return "🟥 lean bear" + tag
+    else:             return "🟡 neutral"
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_world_bank(country_code: str, indicator: str) -> dict:
     """Fetch latest macro data from World Bank (free, no key)."""
@@ -732,27 +839,11 @@ def get_orb_stats(symbol: str):
 #  SCORECARD SCORING FUNCTIONS
 # ══════════════════════════════════════════════════════════════
 
-def _score_cot(name: str, cot_df) -> float | None:
-    entry = INSTRUMENT_COT_MAP.get(name)
-    if entry is None or cot_df is None:
-        return None
-    cot_key, direction = entry
-    code, kw = COT_CODES.get(cot_key, (None, None))
-    if not code:
-        return None
-    mask = (
-        cot_df["contract_code"].str.contains(code, na=False, case=False)
-        | cot_df["market_name"].str.contains(kw.split()[0], na=False, case=False)
-    )
-    sub = cot_df[mask]
-    if sub.empty:
-        return None
-    r = sub.iloc[0]
-    if pd.isna(r.get("retail_long")) and pd.isna(r.get("retail_short")):
-        return None
-    retail_lean, comm_lean, nc_lean = cot_leans(r)
-    raw = cot_raw_signal(retail_lean, comm_lean, nc_lean)   # fade retail, confirm w/ smart money
-    return round(raw * direction, 2)
+def _score_cot(name: str, cot_df=None) -> float | None:
+    # COT Index (Commercials vs Retail) over 26w / 156w — follow commercials,
+    # fade retail, each measured within its own historical range.
+    sig = get_cot_index_signal(name)
+    return sig["score"] if sig else None
 
 def _score_carry(name: str, cb_rates: dict) -> float | None:
     if "/" not in name:
@@ -1003,7 +1094,7 @@ with tab_score:
         st.info("Select instruments in the sidebar.")
     else:
         with st.spinner("Computing scorecard (first run may take ~30 seconds)…"):
-            cot_df_sc = get_cot_data()
+            cot_df_sc = None   # COT now uses per-instrument historical index (get_cot_index_signal)
             macro_sc  = get_all_macro_scores()
             sg        = get_sentiment_gauge()
             fg_val    = sg["composite"] if sg else None
@@ -1461,61 +1552,54 @@ Structure:
 # TAB 6 — COT REPORT
 # ══════════════════════════════════════════════════════════════
 with tab_cot:
-    st.header("📋  COT — Fade Retail, Follow Smart Money")
+    st.header("📋  COT Index — Commercials vs Retail")
     st.caption(
-        "Strategy: trade **against retail** (small/nonreportable traders) when they're "
-        "at an extreme — strongest when **commercials or non-commercials sit on the "
-        "opposite side** (✓smart). Financials from the TFF report; metals from the "
-        "disaggregated report. 'Lean' = net ÷ gross for each group (−100% short … +100% long)."
+        f"Each group's net (% of OI) placed within its **own** range: 0 = most bearish, "
+        f"100 = most bullish. Index lookback **{COT_LB_SHORT}w**, historical hi/lo over "
+        f"**{COT_LB_LONG}w**. Bullish when **commercials high (buying) & retail low (selling)** — "
+        "this is why gold reads bullish even though commercials are net-short in absolute terms. "
+        "Financials from the TFF report; metals from the disaggregated report."
     )
 
-    with st.spinner("Fetching latest CFTC reports…"):
-        cot_df = get_cot_data()
-
-    if cot_df is None:
-        st.warning("COT data unavailable (CFTC site may be down or format changed).")
-    else:
+    cot_names = [n for n in ALL_INSTRUMENTS if n in INSTRUMENT_COT_MAP] or list(INSTRUMENT_COT_MAP.keys())
+    with st.spinner("Building COT indices (first run pulls 3y history per market)…"):
         cot_rows = []
-        for label, (code, kw) in COT_CODES.items():
-            mask = (
-                cot_df["contract_code"].str.contains(code, na=False, case=False)
-                | cot_df["market_name"].str.contains(kw.split()[0], na=False, case=False)
-            )
-            sub = cot_df[mask]
-            if sub.empty:
+        for nm in cot_names:
+            o = get_cot_index_signal(nm)
+            if o is None:
                 continue
-            r = sub.iloc[0]
-            if pd.isna(r.get("retail_long")) and pd.isna(r.get("retail_short")):
-                continue
-            retail_lean, comm_lean, nc_lean = cot_leans(r)
-            raw = cot_raw_signal(retail_lean, comm_lean, nc_lean)
             cot_rows.append({
-                "Market":       label,
-                "Retail":       f"{retail_lean*100:+.0f}%",
-                "Commercials":  f"{comm_lean*100:+.0f}%",
-                "Non-Comm":     f"{nc_lean*100:+.0f}%",
-                "Open Int":     int(r["open_interest"]) if pd.notna(r.get("open_interest")) else None,
-                "Signal":       cot_bias_label(raw, retail_lean, comm_lean, nc_lean),
-                "_retail":      retail_lean * 100,
+                "Instrument":   nm,
+                f"Comm {COT_LB_SHORT}w":   f"{o['comm_s']:.0f}",
+                f"Comm {COT_LB_LONG}w":    f"{o['comm_l']:.0f}",
+                f"Retail {COT_LB_SHORT}w": f"{o['retail_s']:.0f}",
+                f"Retail {COT_LB_LONG}w":  f"{o['retail_l']:.0f}",
+                "Signal":       cot_index_label(o),
+                "_score":       o["score"],
+                "_comm":        o["comm_l"],
+                "_retail":      o["retail_l"],
             })
-        if cot_rows:
-            cot_table = pd.DataFrame(cot_rows).sort_values("_retail")
-            st.dataframe(cot_table.drop(columns=["_retail"]),
-                         use_container_width=True, hide_index=True, height=460)
 
-            st.subheader("Retail positioning (we fade the extremes)")
-            plot_df = cot_table.sort_values("_retail")
-            fig_cot = go.Figure(go.Bar(
-                x=plot_df["_retail"], y=plot_df["Market"], orientation="h",
-                marker_color=["#f85149" if v > 0 else "#56d364" for v in plot_df["_retail"]],
-                text=[f"{v:+.0f}%" for v in plot_df["_retail"]], textposition="outside"))
-            fig_cot.update_layout(
-                title="Retail net lean — red = retail LONG (fade short), green = retail SHORT (fade long)",
-                template="plotly_dark", height=480, showlegend=False,
-                xaxis_title="Retail net lean %", xaxis=dict(range=[-105, 105]))
-            st.plotly_chart(fig_cot, use_container_width=True)
-        else:
-            st.info("No matching markets parsed from the report.")
+    if not cot_rows:
+        st.warning("COT history unavailable (CFTC API may be down).")
+    else:
+        cdf = pd.DataFrame(cot_rows).sort_values("_score", ascending=False)
+        st.dataframe(cdf.drop(columns=["_score", "_comm", "_retail"]),
+                     use_container_width=True, hide_index=True, height=460)
+
+        st.subheader(f"Commercials vs Retail — {COT_LB_LONG}-week COT Index")
+        fig_cot = go.Figure()
+        fig_cot.add_trace(go.Bar(name="Commercials", x=cdf["Instrument"], y=cdf["_comm"],
+                                 marker_color="#56d364"))
+        fig_cot.add_trace(go.Bar(name="Retail", x=cdf["Instrument"], y=cdf["_retail"],
+                                 marker_color="#f85149"))
+        fig_cot.add_hline(y=80, line_dash="dot", line_color="#8b949e", annotation_text="bullish extreme")
+        fig_cot.add_hline(y=20, line_dash="dot", line_color="#8b949e", annotation_text="bearish extreme")
+        fig_cot.update_layout(barmode="group", template="plotly_dark", height=420,
+                              yaxis=dict(range=[0, 100], title="COT Index (0-100)"),
+                              xaxis_tickangle=-30,
+                              title="High commercials + low retail = bullish setup")
+        st.plotly_chart(fig_cot, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════
