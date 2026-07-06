@@ -181,57 +181,94 @@ def get_prices(symbol: str, period: str = "1y", interval: str = "1d"):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cot_data():
-    url     = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
+    """Unified COT positioning from two CFTC reports (column layouts verified
+    against live rows):
+      • FinFutWk.txt  — financial futures (FX, indices, rates)
+      • f_disagg.txt  — disaggregated (metals & physical commodities)
+    Normalised to commercials / non-commercials / retail (nonreportable)."""
     headers = {"User-Agent": "Mozilla/5.0 (FundamentalDashboardV3)"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code != 200:
+
+    def parse_csv(line):
+        parts, cur, in_q = [], "", False
+        for ch in line:
+            if ch == '"':
+                in_q = not in_q
+            elif ch == "," and not in_q:
+                parts.append(cur.strip().strip('"')); cur = ""
+            else:
+                cur += ch
+        parts.append(cur.strip().strip('"'))
+        return parts
+
+    def fetch(url, spec):
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                return None
+            df = pd.DataFrame([parse_csv(l) for l in resp.text.split("\n") if l.strip()])
+            if df.shape[1] <= spec["max_idx"]:
+                return None
+            def col_sum(idxs):
+                s = None
+                for i in idxs:
+                    v = pd.to_numeric(df[i].astype(str).str.replace(",", ""), errors="coerce")
+                    s = v if s is None else s + v
+                return s
+            out = pd.DataFrame()
+            out["market_name"]   = df[0].astype(str).str.strip()
+            out["contract_code"] = df[3].astype(str).str.strip()
+            out["open_interest"] = col_sum([spec["oi"]])
+            out["comm_long"]     = col_sum(spec["comm_long"])
+            out["comm_short"]    = col_sum(spec["comm_short"])
+            out["nc_long"]       = col_sum(spec["nc_long"])
+            out["nc_short"]      = col_sum(spec["nc_short"])
+            out["retail_long"]   = col_sum(spec["retail_long"])
+            out["retail_short"]  = col_sum(spec["retail_short"])
+            return out
+        except Exception:
             return None
-        lines = [l.strip() for l in resp.text.split("\n") if l.strip()]
-        def parse_csv(line):
-            parts, cur, in_q = [], "", False
-            for ch in line:
-                if ch == '"':
-                    in_q = not in_q
-                elif ch == "," and not in_q:
-                    parts.append(cur.strip().strip('"')); cur = ""
-                else:
-                    cur += ch
-            parts.append(cur.strip().strip('"'))
-            return parts
-        rows = [parse_csv(l) for l in lines]
-        df   = pd.DataFrame(rows)
-        if df.shape[1] < 17:
-            return None
-        # CFTC "Traders in Financial Futures" (FinFutWk) short-format layout:
-        #  0 market  3 contract_code  7 open_interest
-        #  8-10 Dealer L/S/Spread  11-13 Asset-Mgr L/S/Spread  14-16 Leveraged L/S/Spread
-        named = [
-            "market_name","date_str","report_date","contract_code",
-            "mkt_code","region_code","commodity_code","open_interest",
-            "dealer_long","dealer_short","dealer_spread",
-            "am_long","am_short","am_spread",
-            "lev_long","lev_short","lev_spread",
-        ]
-        n = df.shape[1]
-        df.columns = named + [f"_c{i}" for i in range(len(named), n)]
-        num_cols = ["open_interest","dealer_long","dealer_short","dealer_spread",
-                    "am_long","am_short","am_spread","lev_long","lev_short","lev_spread"]
-        for c in num_cols:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",",""), errors="coerce")
-        # Non-commercial (large speculators) = Asset Managers + Leveraged Funds
-        df["nc_long"]  = df["am_long"].fillna(0)  + df["lev_long"].fillna(0)
-        df["nc_short"] = df["am_short"].fillna(0) + df["lev_short"].fillna(0)
-        df["nc_net"]   = df["nc_long"] - df["nc_short"]
-        # Commercial (dealers / intermediaries)
-        df["comm_long"]  = df["dealer_long"]
-        df["comm_short"] = df["dealer_short"]
-        df["comm_net"]   = df["comm_long"] - df["comm_short"]
-        df["contract_code"] = df["contract_code"].astype(str).str.strip()
-        df["market_name"]   = df["market_name"].astype(str).str.strip()
-        return df
-    except Exception:
+
+    # Traders in Financial Futures (FX / indices / rates): Dealer = commercial,
+    # AssetMgr+Leveraged+Other = non-commercial, Nonreportable(22/23) = retail.
+    TFF = {"oi":7, "comm_long":[8], "comm_short":[9],
+           "nc_long":[11,14,17], "nc_short":[12,15,18],
+           "retail_long":[22], "retail_short":[23], "max_idx":23}
+    # Disaggregated (metals): Producer+Swap = commercial, ManagedMoney+Other =
+    # non-commercial, Nonreportable(21/22) = retail.
+    DIS = {"oi":7, "comm_long":[8,10], "comm_short":[9,11],
+           "nc_long":[13,16], "nc_short":[14,17],
+           "retail_long":[21], "retail_short":[22], "max_idx":22}
+
+    fin = fetch("https://www.cftc.gov/dea/newcot/FinFutWk.txt", TFF)
+    com = fetch("https://www.cftc.gov/dea/newcot/f_disagg.txt",  DIS)
+    parts = [p for p in (fin, com) if p is not None and not p.empty]
+    if not parts:
         return None
+    df = pd.concat(parts, ignore_index=True)
+    df["comm_net"]   = df["comm_long"]   - df["comm_short"]
+    df["nc_net"]     = df["nc_long"]     - df["nc_short"]
+    df["retail_net"] = df["retail_long"] - df["retail_short"]
+    return df
+
+def cot_leans(r):
+    """Directional lean of each group as (net / gross), range -1..+1."""
+    def lean(l, s):
+        l = 0.0 if pd.isna(l) else float(l)
+        s = 0.0 if pd.isna(s) else float(s)
+        t = l + s
+        return (l - s) / t if t > 0 else 0.0
+    return (lean(r.get("retail_long"), r.get("retail_short")),
+            lean(r.get("comm_long"),   r.get("comm_short")),
+            lean(r.get("nc_long"),     r.get("nc_short")))
+
+def cot_raw_signal(retail_lean, comm_lean, nc_lean):
+    """Trade AGAINST retail; amplify when commercials or non-commercials sit on
+    the opposite side of retail (confirming the fade). Returns -1..+1."""
+    base = -retail_lean
+    amp  = 1.0
+    if comm_lean * retail_lean < 0: amp += abs(comm_lean) * 0.5
+    if nc_lean   * retail_lean < 0: amp += abs(nc_lean)   * 0.5
+    return float(np.clip(base * amp, -1.0, 1.0))
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_world_bank(country_code: str, indicator: str) -> dict:
@@ -710,12 +747,12 @@ def _score_cot(name: str, cot_df) -> float | None:
     sub = cot_df[mask]
     if sub.empty:
         return None
-    r   = sub.iloc[0]
-    nc  = r.get("nc_net", np.nan)
-    oi  = r.get("open_interest", 1) or 1
-    if pd.isna(nc):
+    r = sub.iloc[0]
+    if pd.isna(r.get("retail_long")) and pd.isna(r.get("retail_short")):
         return None
-    return round(float(np.clip(nc / float(oi) / 0.15, -1, 1)) * direction, 2)
+    retail_lean, comm_lean, nc_lean = cot_leans(r)
+    raw = cot_raw_signal(retail_lean, comm_lean, nc_lean)   # fade retail, confirm w/ smart money
+    return round(raw * direction, 2)
 
 def _score_carry(name: str, cb_rates: dict) -> float | None:
     if "/" not in name:
@@ -836,15 +873,17 @@ def compute_scorecard(instruments: dict, cb_rates: dict, cot_df,
         })
     return pd.DataFrame(rows).sort_values("Score /5", ascending=False)
 
-def cot_bias_label(nc_net, oi):
-    if pd.isna(nc_net) or not oi:
+def cot_bias_label(raw, retail_lean, comm_lean, nc_lean):
+    """Fade-retail bias for the COT tab (from the market's own perspective)."""
+    if raw is None:
         return "— N/A"
-    r = nc_net / float(oi) * 100
-    if   r >  15: return "🟢 STRONG BULL"
-    elif r >   5: return "🟩 BULL"
-    elif r < -15: return "🔴 STRONG BEAR"
-    elif r <  -5: return "🟥 BEAR"
-    else:         return "🟡 NEUTRAL"
+    smart_opp = (comm_lean * retail_lean < 0) or (nc_lean * retail_lean < 0)
+    tag = " ✓smart" if (smart_opp and abs(retail_lean) > 0.05) else ""
+    if   raw >  0.33: return "🟢 LONG (fade retail)" + tag
+    elif raw >  0.10: return "🟩 lean long" + tag
+    elif raw < -0.33: return "🔴 SHORT (fade retail)" + tag
+    elif raw < -0.10: return "🟥 lean short" + tag
+    else:             return "🟡 neutral"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -951,7 +990,7 @@ with tab_score:
         st.markdown("""
 | Component | Source | Logic |
 |---|---|---|
-| **COT** | CFTC futures | Spec net / OI ratio → +1 (max long) to –1 (max short) |
+| **COT** | CFTC futures | Fade retail (nonreportable) extremes; amplified when commercials/non-comms sit opposite. +1 = fade-long, −1 = fade-short |
 | **Carry** | CB rates (sidebar) | Rate differential ±5% → ±1 |
 | **Macro** | World Bank GDP/CPI/unemployment | G7 hawkishness score per country |
 | **Valuation** | yfinance daily | Z-score inverted: cheap = bullish |
@@ -1422,10 +1461,15 @@ Structure:
 # TAB 6 — COT REPORT
 # ══════════════════════════════════════════════════════════════
 with tab_cot:
-    st.header("📋  COT — CFTC Speculator Positioning")
-    st.caption("Latest Financial Futures (TFF) report. Net = non-commercial long − short.")
+    st.header("📋  COT — Fade Retail, Follow Smart Money")
+    st.caption(
+        "Strategy: trade **against retail** (small/nonreportable traders) when they're "
+        "at an extreme — strongest when **commercials or non-commercials sit on the "
+        "opposite side** (✓smart). Financials from the TFF report; metals from the "
+        "disaggregated report. 'Lean' = net ÷ gross for each group (−100% short … +100% long)."
+    )
 
-    with st.spinner("Fetching latest CFTC report…"):
+    with st.spinner("Fetching latest CFTC reports…"):
         cot_df = get_cot_data()
 
     if cot_df is None:
@@ -1440,29 +1484,35 @@ with tab_cot:
             sub = cot_df[mask]
             if sub.empty:
                 continue
-            r  = sub.iloc[0]
-            nc = r.get("nc_net", np.nan)
-            oi = r.get("open_interest", np.nan)
+            r = sub.iloc[0]
+            if pd.isna(r.get("retail_long")) and pd.isna(r.get("retail_short")):
+                continue
+            retail_lean, comm_lean, nc_lean = cot_leans(r)
+            raw = cot_raw_signal(retail_lean, comm_lean, nc_lean)
             cot_rows.append({
-                "Market":     label,
-                "Spec Long":  int(r["nc_long"])  if pd.notna(r.get("nc_long"))  else None,
-                "Spec Short": int(r["nc_short"]) if pd.notna(r.get("nc_short")) else None,
-                "Net":        int(nc) if pd.notna(nc) else None,
-                "Open Int":   int(oi) if pd.notna(oi) else None,
-                "Bias":       cot_bias_label(nc, oi),
+                "Market":       label,
+                "Retail":       f"{retail_lean*100:+.0f}%",
+                "Commercials":  f"{comm_lean*100:+.0f}%",
+                "Non-Comm":     f"{nc_lean*100:+.0f}%",
+                "Open Int":     int(r["open_interest"]) if pd.notna(r.get("open_interest")) else None,
+                "Signal":       cot_bias_label(raw, retail_lean, comm_lean, nc_lean),
+                "_retail":      retail_lean * 100,
             })
         if cot_rows:
-            cot_table = pd.DataFrame(cot_rows)
-            st.dataframe(cot_table, use_container_width=True, hide_index=True)
+            cot_table = pd.DataFrame(cot_rows).sort_values("_retail")
+            st.dataframe(cot_table.drop(columns=["_retail"]),
+                         use_container_width=True, hide_index=True, height=460)
 
-            plot_df = cot_table.dropna(subset=["Net"]).sort_values("Net")
+            st.subheader("Retail positioning (we fade the extremes)")
+            plot_df = cot_table.sort_values("_retail")
             fig_cot = go.Figure(go.Bar(
-                x=plot_df["Net"], y=plot_df["Market"], orientation="h",
-                marker_color=["#56d364" if v > 0 else "#f85149" for v in plot_df["Net"]],
-                text=[f"{v:+,}" for v in plot_df["Net"]], textposition="outside"))
-            fig_cot.update_layout(title="Net non-commercial positioning",
-                                  template="plotly_dark", height=460, showlegend=False,
-                                  xaxis_title="Net contracts")
+                x=plot_df["_retail"], y=plot_df["Market"], orientation="h",
+                marker_color=["#f85149" if v > 0 else "#56d364" for v in plot_df["_retail"]],
+                text=[f"{v:+.0f}%" for v in plot_df["_retail"]], textposition="outside"))
+            fig_cot.update_layout(
+                title="Retail net lean — red = retail LONG (fade short), green = retail SHORT (fade long)",
+                template="plotly_dark", height=480, showlegend=False,
+                xaxis_title="Retail net lean %", xaxis=dict(range=[-105, 105]))
             st.plotly_chart(fig_cot, use_container_width=True)
         else:
             st.info("No matching markets parsed from the report.")
