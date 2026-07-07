@@ -1103,6 +1103,83 @@ with tab_score:
                 macro_sc, fg_val, val_lookback, season_years
             )
 
+        # ── AUTO EXPORT TO MT5 ────────────────────────────────────────
+        # Writes fundamental_bias.json every time scores are computed
+        # All EAs read this file for directional bias
+        try:
+            import json, os, pathlib
+
+            export_data = {
+                "timestamp":   datetime.now().isoformat(),
+                "instruments": {}
+            }
+
+            for _, row in sc_df.iterrows():
+                inst      = row["Instrument"]
+                score     = row["Score /5"]
+                bias_raw  = row["Bias"]
+
+                # Strip emoji for EA parsing
+                bias_clean = (bias_raw
+                    .replace("🟢🟢 ", "").replace("🟢 ", "")
+                    .replace("🔴🔴 ", "").replace("🔴 ", "")
+                    .replace("🟡 ", "").strip())
+
+                # Direction for EA
+                if   score >  1.5: direction = "LONG"
+                elif score < -1.5: direction = "SHORT"
+                else:              direction = "NEUTRAL"
+
+                export_data["instruments"][inst] = {
+                    "score":     round(float(score), 2),
+                    "bias":      bias_clean,
+                    "direction": direction
+                }
+
+            json_str = json.dumps(export_data, indent=2)
+            paths_to_write = []
+
+            # 1. Same folder as dashboard script
+            script_dir = pathlib.Path(__file__).parent
+            paths_to_write.append(script_dir / "fundamental_bias.json")
+
+            # 2. MT5 Common Files folder (Windows)
+            mt5_common = os.environ.get("APPDATA", "")
+            if mt5_common:
+                mt5_path = (pathlib.Path(mt5_common)
+                            / "MetaQuotes" / "Terminal" / "Common" / "Files")
+                if mt5_path.exists():
+                    paths_to_write.append(mt5_path / "fundamental_bias.json")
+
+            # 3. Search for MQL5/Files folder
+            home = pathlib.Path(os.path.expanduser("~"))
+            for candidate in home.rglob("MQL5/Files"):
+                paths_to_write.append(candidate / "fundamental_bias.json")
+                break
+
+            written = []
+            for p in paths_to_write:
+                try:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(json_str)
+                    written.append(str(p))
+                except Exception:
+                    pass
+
+            if written:
+                st.success(
+                    f"✅ Bias exported to MT5 — "
+                    f"{datetime.now().strftime('%H:%M:%S')} | "
+                    f"{len(export_data['instruments'])} instruments"
+                )
+                with st.expander("View exported bias"):
+                    st.json(export_data)
+            else:
+                st.warning("⚠️ Could not write to MT5 folder")
+
+        except Exception as e:
+            st.error(f"Export error: {e}")
+
         # ── Summary row of counts ──────────────────────────────
         bull_n   = (sc_df["Score /5"] >  1.5).sum()
         bear_n   = (sc_df["Score /5"] < -1.5).sum()
