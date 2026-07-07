@@ -925,11 +925,11 @@ def compute_scorecard(instruments: dict, cb_rates: dict, cot_df,
         val_s  = _score_valuation(name, sym, val_lookback)
         seas_s = _score_seasonality(sym, season_years)
         sent_s = _score_sentiment(name, sym, fg) if fg is not None else None
-        # Weighted scoring — COT 5x (#1), Valuation 3.5x (#2), Seasonality 2.5x (#3), others 1x
+        # Weighted scoring — COT 10x dominant (#1), Valuation 3x (#2), Seasonality 2x (#3), others 1x
         WEIGHTS = {
-            "cot":   5.0,   # #1 most weight — Commercials-vs-Retail COT index
-            "val":   3.5,   # #2 — over/undervaluation
-            "seas":  2.5,   # #3 — historical seasonal bias
+            "cot":  10.0,   # #1 dominant — Commercials-vs-Retail COT index (~55% of weight)
+            "val":   3.0,   # #2 — over/undervaluation
+            "seas":  2.0,   # #3 — historical seasonal bias
             "carry": 1.0,   # Secondary
             "macro": 1.0,   # Secondary
             "sent":  1.0,   # Secondary
