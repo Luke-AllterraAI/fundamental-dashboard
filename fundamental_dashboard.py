@@ -639,6 +639,37 @@ def valuation_for_instrument(name: str, symbol: str, lookback: int,
         return get_valuation_ratio(symbol, ref_symbol, lookback), ref_label
     return get_valuation(symbol, lookback), "USD"
 
+# Campus Valuation Tool — intermarket ROC-differential oscillator
+CAMPUS_REFS = {"Bonds (ZB)": "ZB=F", "Gold (GC)": "GC=F", "Dollar (DXY)": "DX-Y.NYB"}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def campus_valuation(symbol: str, ref_syms, roc_len: int = 10, rescale_len: int = 100):
+    """Rate-of-change of `symbol` minus the average ROC of macro references
+    (bonds / gold / dollar), rescaled to -100..+100 over `rescale_len`.
+    High = rich vs the macro references, low = cheap. (Reconstruction of the
+    TradingView CampusValuationTool from its visible inputs.)"""
+    m = get_prices(symbol, period="2y", interval="1d")
+    if m is None or len(m) < rescale_len + roc_len + 5:
+        return None
+    close = m["Close"].dropna()
+    def roc(s): return (s / s.shift(roc_len) - 1.0) * 100.0
+    comp = roc(close)
+    ref_rocs = []
+    for rs in ref_syms:
+        d = get_prices(rs, period="2y", interval="1d")
+        if d is None or len(d) < roc_len + 5:
+            continue
+        ref_rocs.append(roc(d["Close"]).reindex(close.index, method="ffill"))
+    if ref_rocs:
+        comp = comp - pd.concat(ref_rocs, axis=1).mean(axis=1)
+    comp = comp.dropna()
+    if len(comp) < 10:
+        return None
+    lo = comp.rolling(rescale_len, min_periods=10).min()
+    hi = comp.rolling(rescale_len, min_periods=10).max()
+    rescaled = (comp - lo) / (hi - lo).replace(0, np.nan) * 200.0 - 100.0
+    return rescaled.dropna()
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_cross_implied(pair_name: str):
     if pair_name not in CROSS_IMPLIED:
@@ -1796,6 +1827,49 @@ with tab_val:
             st.plotly_chart(fig_val, use_container_width=True)
         else:
             st.info("No valuation data available.")
+
+    # ── Campus Valuation Tool (intermarket ROC oscillator) ────────
+    st.markdown("---")
+    st.subheader("🧭 Campus Valuation Tool")
+    st.caption("ROC of the instrument minus the average ROC of the macro references "
+               "(bonds / gold / dollar), rescaled −100…+100. Above the upper band = rich, "
+               "below the lower band = cheap.")
+
+    cv_names = list(ALL_INSTRUMENTS.keys()) or ["S&P 500"]
+    v1, v2, v3, v4 = st.columns([2, 1, 1, 1])
+    cv_name  = v1.selectbox("Instrument", cv_names, key="cv_sel")
+    cv_roc   = v2.number_input("ROC Length", 2, 50, 10, step=1, key="cv_roc")
+    cv_up    = v3.number_input("Upper Threshold", 0, 100, 75, step=5, key="cv_up")
+    cv_lo    = v4.number_input("Lower Threshold", -100, 0, -75, step=5, key="cv_lo")
+    cv_refs  = st.multiselect("Reference symbols", list(CAMPUS_REFS.keys()),
+                              default=list(CAMPUS_REFS.keys()), key="cv_refs")
+
+    cv_sym = ALL_INSTRUMENTS.get(cv_name, "^GSPC")
+    ref_syms = [CAMPUS_REFS[r] for r in cv_refs]
+    with st.spinner("Computing Campus valuation…"):
+        cv = campus_valuation(cv_sym, ref_syms, cv_roc, 100)
+    if cv is None or cv.empty:
+        st.info("Not enough data for the Campus valuation on this instrument.")
+    else:
+        fig_cv = go.Figure(go.Scatter(x=cv.index, y=cv.values, mode="lines",
+                                      line=dict(color="#58a6ff", width=2), name=cv_name))
+        fig_cv.add_hline(y=cv_up, line_dash="dash", line_color="#f85149",
+                         annotation_text=f"Rich {cv_up}")
+        fig_cv.add_hline(y=cv_lo, line_dash="dash", line_color="#56d364",
+                         annotation_text=f"Cheap {cv_lo}")
+        fig_cv.add_hline(y=0, line_dash="dot", line_color="#8b949e")
+        fig_cv.update_layout(title=f"{cv_name} — Campus Valuation (vs {', '.join(cv_refs) or 'none'})",
+                             template="plotly_dark", height=400,
+                             yaxis=dict(range=[-110, 110], title="Valuation −100…+100"))
+        st.plotly_chart(fig_cv, use_container_width=True)
+
+        now = float(cv.iloc[-1])
+        state = ("🔴 RICH (overvalued)" if now >= cv_up
+                 else "🟢 CHEAP (undervalued)" if now <= cv_lo else "🟡 fair")
+        cvm1, cvm2 = st.columns(2)
+        cvm1.metric("Campus valuation now", f"{now:+.1f}")
+        cvm2.metric("Read", "")
+        cvm2.markdown(f"**{state}**")
 
 
 # ══════════════════════════════════════════════════════════════
