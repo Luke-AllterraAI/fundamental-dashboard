@@ -328,6 +328,14 @@ def cot_index(series, lookback):
     cur = float(series.iloc[-1])
     return (cur - lo) / (hi - lo) * 100.0 if hi > lo else 50.0
 
+def rolling_cot_index(series, lookback):
+    """Normalise EVERY point to 0-100 within its trailing `lookback` window
+    (rolling stochastic) — for the Retail vs Smart-Money oscillator."""
+    lo  = series.rolling(lookback, min_periods=5).min()
+    hi  = series.rolling(lookback, min_periods=5).max()
+    rng = (hi - lo).replace(0, np.nan)
+    return (series - lo) / rng * 100.0
+
 def resolve_cot(name):
     entry = INSTRUMENT_COT_MAP.get(name)
     if entry is None:
@@ -1677,6 +1685,54 @@ with tab_cot:
                               xaxis_tickangle=-30,
                               title="High commercials + low retail = bullish setup")
         st.plotly_chart(fig_cot, use_container_width=True)
+
+    # ── Retail vs Smart Money (Normalized) oscillator ─────────────
+    st.markdown("---")
+    st.subheader("📈 Retail vs Smart Money (Normalized)")
+    st.caption("Each group's weekly net normalized 0-100 over a rolling lookback. "
+               "Fade retail at extremes; smart money (commercials) usually sits opposite.")
+
+    osc_names = [n for n in ALL_INSTRUMENTS if n in INSTRUMENT_COT_MAP] or list(INSTRUMENT_COT_MAP.keys())
+    oc1, oc2, oc3, oc4 = st.columns([2, 1, 1, 1])
+    osc_name = oc1.selectbox("Instrument", osc_names, key="osc_sel")
+    osc_lb   = oc2.number_input("Lookback (weeks)", 20, 156, 100, step=1, key="osc_lb")
+    osc_ob   = oc3.number_input("Overbought", 50, 100, 80, step=5, key="osc_ob")
+    osc_os   = oc4.number_input("Oversold", 0, 50, 20, step=5, key="osc_os")
+
+    _res = resolve_cot(osc_name)
+    hist = get_cot_history(_res[0], _res[1]) if _res else None
+    if hist is None or len(hist) < 10:
+        st.info("Not enough COT history for this instrument.")
+    else:
+        retail_n = rolling_cot_index(hist["retail_net"], osc_lb)
+        smart_n  = rolling_cot_index(hist["comm_net"],   osc_lb)   # commercials = smart money
+        fig_osc = go.Figure()
+        fig_osc.add_trace(go.Scatter(x=hist["date"], y=retail_n, name="Retail",
+                                     line=dict(color="#58a6ff", width=2)))
+        fig_osc.add_trace(go.Scatter(x=hist["date"], y=smart_n, name="Smart Money",
+                                     line=dict(color="#f85149", width=2)))
+        fig_osc.add_hline(y=osc_ob, line_dash="dash", line_color="#56d364",
+                          annotation_text=f"Overbought {osc_ob}")
+        fig_osc.add_hline(y=osc_os, line_dash="dash", line_color="#f85149",
+                          annotation_text=f"Oversold {osc_os}")
+        fig_osc.update_layout(title=f"{osc_name} — Retail vs Smart Money Net Positions (Normalized)",
+                              template="plotly_dark", height=420,
+                              yaxis=dict(range=[-5, 105], title="Normalized 0-100"),
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+        st.plotly_chart(fig_osc, use_container_width=True)
+
+        rl = float(retail_n.iloc[-1]) if pd.notna(retail_n.iloc[-1]) else 50.0
+        sm = float(smart_n.iloc[-1])  if pd.notna(smart_n.iloc[-1])  else 50.0
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Retail now", f"{rl:.1f}",
+                  "overbought" if rl >= osc_ob else "oversold" if rl <= osc_os else "neutral")
+        m2.metric("Smart Money now", f"{sm:.1f}",
+                  "overbought" if sm >= osc_ob else "oversold" if sm <= osc_os else "neutral")
+        if   rl >= osc_ob and sm <= osc_os: call = "🔴 Retail extreme LONG vs smart short → fade SHORT"
+        elif rl <= osc_os and sm >= osc_ob: call = "🟢 Retail extreme SHORT vs smart long → fade LONG"
+        else:                               call = "🟡 no clean divergence"
+        m3.metric("Signal", "")
+        m3.markdown(f"**{call}**")
 
 
 # ══════════════════════════════════════════════════════════════
