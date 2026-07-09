@@ -1739,9 +1739,9 @@ with tab_cot:
         smart_n  = rolling_cot_index(hist["comm_net"],   osc_lb)   # commercials = smart money
         fig_osc = go.Figure()
         fig_osc.add_trace(go.Scatter(x=hist["date"], y=retail_n, name="Retail",
-                                     line=dict(color="#58a6ff", width=2)))
+                                     line=dict(color="#f85149", width=2)))   # retail = red
         fig_osc.add_trace(go.Scatter(x=hist["date"], y=smart_n, name="Smart Money",
-                                     line=dict(color="#f85149", width=2)))
+                                     line=dict(color="#58a6ff", width=2)))   # smart money = blue
         fig_osc.add_hline(y=osc_ob, line_dash="dash", line_color="#56d364",
                           annotation_text=f"Overbought {osc_ob}")
         fig_osc.add_hline(y=osc_os, line_dash="dash", line_color="#f85149",
